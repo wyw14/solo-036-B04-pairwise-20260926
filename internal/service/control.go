@@ -437,24 +437,63 @@ func (r *Runtime) Receive(runID string, request ReceiveRequest) (model.Operation
 }
 
 func (r *Runtime) Complete(runID, routeID string) (model.OperationRecord, error) {
+	current, ok := r.Runs.Get(runID)
+	if !ok {
+		return model.OperationRecord{}, fmt.Errorf("run %s not found", runID)
+	}
+	if current.State != model.StateDepressurizing {
+		return model.OperationRecord{}, fmt.Errorf("run state %s cannot complete", current.State)
+	}
+
+	// Verify route identity and occupancy BEFORE the run becomes terminal.
+	// The coordinator is the source of truth for fencing; the persisted
+	// control state is cross-checked so the two cannot disagree. A wrong,
+	// empty, or foreign route ID is rejected here, leaving the run in
+	// depressurizing and its real lease intact (still usable, still
+	// retryable) instead of stranding the line on a finished run.
+	control := r.ensureControl()
+	r.mu.Lock()
+	routeState, known := control.Routes[routeID]
+	controlMatches := known && routeState.Reserved && routeState.RunID == runID
+	r.mu.Unlock()
+	if !known {
+		return model.OperationRecord{}, fmt.Errorf("unknown route %s", routeID)
+	}
+	lease, leased := r.Routes.Owner(routeID)
+	if !leased || lease.RunID != runID {
+		if leased {
+			return model.OperationRecord{}, fmt.Errorf("route %s is fenced to run %s", routeID, lease.RunID)
+		}
+		return model.OperationRecord{}, fmt.Errorf("route %s is not reserved by run %s", routeID, runID)
+	}
+	if !controlMatches {
+		return model.OperationRecord{}, fmt.Errorf("route %s is not held by run %s", routeID, runID)
+	}
+
 	if err := run.Complete(r.Runs, runID); err != nil {
 		return model.OperationRecord{}, err
 	}
-	r.Routes.Release(routeID, runID)
-	r.mu.Lock()
-	if routeState, ok := r.control.Routes[routeID]; ok && routeState.RunID == runID {
-		routeState.RunID = ""
-		routeState.Reserved = false
-		routeState.LeaseEpoch = 0
-		routeState.UpdatedAt = time.Now().UTC()
-		r.control.Routes[routeID] = routeState
+	// Identity was verified above, so this release cannot silently no-op.
+	if _, err := r.Routes.ReleaseIfOwner(routeID, runID); err != nil {
+		// Defensive: ownership only changes under a concurrent mutation.
+		// Surface it rather than leaving a terminal run holding the route.
+		r.recordIncident(runID, "critical", err.Error())
+		return model.OperationRecord{}, err
 	}
+	now := time.Now().UTC()
+	r.mu.Lock()
+	routeState.RunID = ""
+	routeState.Reserved = false
+	routeState.LeaseEpoch = 0
+	routeState.UpdatedAt = now
+	r.control.Routes[routeID] = routeState
 	r.control.Revision = model.NewRevision()
 	r.mu.Unlock()
 	if err := r.appendEvent(model.Event{
 		RunID:   runID,
 		Kind:    "complete",
 		Payload: routeID,
+		At:      now,
 	}); err != nil {
 		return model.OperationRecord{}, err
 	}
