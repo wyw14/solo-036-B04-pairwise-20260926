@@ -437,6 +437,33 @@ func (r *Runtime) Receive(runID string, request ReceiveRequest) (model.Operation
 }
 
 func (r *Runtime) Complete(runID, routeID string) (model.OperationRecord, error) {
+	if strings.TrimSpace(routeID) == "" {
+		return model.OperationRecord{}, errors.New("route id is required")
+	}
+	current, ok := r.Runs.Get(runID)
+	if !ok {
+		return model.OperationRecord{}, fmt.Errorf("run %s not found", runID)
+	}
+	if current.State.Terminal() {
+		return model.OperationRecord{}, fmt.Errorf("run state %s cannot complete", current.State)
+	}
+	lease, leased := r.Routes.LeaseOf(runID)
+	if !leased {
+		return model.OperationRecord{}, fmt.Errorf("run %s holds no route lease", runID)
+	}
+	if lease.Route != routeID {
+		return model.OperationRecord{}, fmt.Errorf("run %s occupies route %s, not %s", runID, lease.Route, routeID)
+	}
+	control := r.ensureControl()
+	r.mu.Lock()
+	routeState, known := control.Routes[routeID]
+	r.mu.Unlock()
+	if !known {
+		return model.OperationRecord{}, fmt.Errorf("unknown route %s", routeID)
+	}
+	if !routeState.Reserved || routeState.RunID != runID {
+		return model.OperationRecord{}, fmt.Errorf("route %s is not occupied by run %s", routeID, runID)
+	}
 	if err := run.Complete(r.Runs, runID); err != nil {
 		return model.OperationRecord{}, err
 	}
